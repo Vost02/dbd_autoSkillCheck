@@ -1,17 +1,15 @@
 import os
 from time import time, sleep
-import gradio as gr
+
+from gradio import (
+    Dropdown, Radio, Number, Image, Label, Button, Slider,
+    skip, Info, Warning, Error, Blocks, Row, Column, Markdown,
+)
 
 from dbd.AI_model import AI_model
+from dbd.tracker import QTETracker
 from dbd.utils.directkeys import PressKey, ReleaseKey, SPACE
-from dbd.utils.monitoring_mss import Monitoring_mss
-
-try:
-    from dbd.utils.monitoring_bettercam import Monitoring_bettercam
-    bettercam_ok = True
-    print("Info: Bettercam feature available.")
-except ImportError:
-    bettercam_ok = False
+from dbd.utils.monitor import get_monitors, get_monitor_attributes, get_frame
 
 
 ai_model = None
@@ -23,51 +21,72 @@ def cleanup():
     return 0.
 
 
-def monitor(ai_model_path, device, monitoring_str, monitor_id, hit_ante, nb_cpu_threads):
+def monitor(ai_model_path, device, monitor_id, hit_ante, nb_cpu_threads):
     if ai_model_path is None or not os.path.exists(ai_model_path):
-        raise gr.Error("Invalid AI model file", duration=0)
+        raise Error("Invalid AI model file", duration=0)
 
     if device is None:
-        raise gr.Error("Invalid device option")
+        raise Error("Invalid device option")
 
     if monitor_id is None:
-        raise gr.Error("Invalid monitor option")
+        raise Error("Invalid monitor option")
 
     use_gpu = (device == devices[1])
 
-    if monitoring_str == "bettercam" and bettercam_ok:
-        monitoring = Monitoring_bettercam(monitor_id=monitor_id, crop_size=224, target_fps=240)
-    else:
-        monitoring = Monitoring_mss(monitor_id=monitor_id, crop_size=224)
-
     try:
         global ai_model
-        ai_model = AI_model(ai_model_path, use_gpu, nb_cpu_threads, monitoring)
+        ai_model = AI_model(ai_model_path, use_gpu, nb_cpu_threads, monitor_id)
         execution_provider = ai_model.check_provider()
     except Exception as e:
-        raise gr.Error("Error when loading AI model: {}".format(e), duration=0)
+        raise Error("Error when loading AI model: {}".format(e), duration=0)
 
     if execution_provider == "CUDAExecutionProvider":
-        gr.Info("Running AI model on GPU (success, CUDA)")
+        Info("Running AI model on GPU (success, CUDA)")
     elif execution_provider == "DmlExecutionProvider":
-        gr.Info("Running AI model on GPU (success, DirectML)")
+        Info("Running AI model on GPU (success, DirectML)")
     elif execution_provider == "TensorRT":
-        gr.Info("Running AI model on GPU (success, TensorRT)")
+        Info("Running AI model on GPU (success, TensorRT)")
     else:
-        gr.Info(f"Running AI model on CPU (success, {nb_cpu_threads} threads)")
+        Info(f"Running AI model on CPU (success, {nb_cpu_threads} threads)")
         if use_gpu:
             Warning("Could not run AI model on GPU device. Check python console logs to debug.")
 
     # Variables
     t0 = time()
     nb_frames = 0
+    fps = 0.0
+
+    tracker = QTETracker("dbd/template/space_template.png", monitor_id)
+    last_pred_was_none = False
 
     try:
         while True:
-            frame_np = ai_model.grab_screenshot()
-            nb_frames += 1
+            crop = tracker.update(last_pred_was_none)
+            nb_frames += 1  # 每一轮循环都计为一帧，确保 FPS 实时累加
 
-            pred, desc, probs, should_hit = ai_model.predict(frame_np)
+            if crop is None:
+                last_pred_was_none = True
+                
+                # 修复 FPS 冻结：在没有 QTE 出现时，依然实时计算并刷新 UI 上的 FPS 指示器
+                t_diff = time() - t0
+                if t_diff > 1.0:
+                    fps = round(nb_frames / t_diff, 1)
+                    yield fps, skip(), skip()
+                    t0 = time()
+                    nb_frames = 0
+                else:
+                    # 在没有 QTE 截图时引入 5ms 的极小延迟，防止 while 循环把单核 CPU 跑满到 100%
+                    sleep(0.005)
+                continue
+
+            # 完全恢复你原本工作正常的底层数据流与转换逻辑，100% 规避 ONNX 类型错误
+            ai_model.monitor = crop
+            screenshot = ai_model.grab_screenshot()
+            image_pil = ai_model.screenshot_to_pil(screenshot)
+            image_np = ai_model.pil_to_numpy(image_pil)
+
+            pred, desc, probs, should_hit = ai_model.predict(image_np)
+            last_pred_was_none = (pred == 0)
 
             if should_hit:
                 # ante-frontier hit delay
@@ -78,25 +97,24 @@ def monitor(ai_model_path, device, monitoring_str, monitor_id, hit_ante, nb_cpu_
                 sleep(0.005)
                 ReleaseKey(SPACE)
 
-                yield gr.skip(), frame_np, probs
+                yield skip(), image_pil, probs
 
                 sleep(0.5)  # avoid hitting the same skill check multiple times
                 t0 = time()
                 nb_frames = 0
                 continue
 
-            # Compute fps
+            # Compute fps (QTE 激活锁定状态下的 FPS 计算)
             t_diff = time() - t0
             if t_diff > 1.0:
                 fps = round(nb_frames / t_diff, 1)
-                yield fps, gr.skip(), gr.skip()
+                yield fps, skip(), skip()
 
                 t0 = time()
                 nb_frames = 0
 
     except Exception as e:
-        # print(e)
-        pass
+        print(f"Runtime error in monitor loop: {e}")
     finally:
         print("Monitoring stopped.")
 
@@ -106,72 +124,55 @@ if __name__ == "__main__":
 
     fps_info = "Number of frames per second the AI model analyses the monitored frame."
     devices = ["CPU (default)", "GPU"]
-    cpu_choices = [("Low", 2), ("Normal", 4), ("High", 6), ("CPU BBQ Mode", 8)]
+    cpu_choices = [("Low", 2), ("Normal", 4), ("High", 6), ("Computer Killer Mode", 8)]
 
     # Find available AI models
     model_files = [(f, f'{models_folder}/{f}') for f in os.listdir(f"{models_folder}/") if f.endswith(".onnx") or f.endswith(".trt")]
     if len(model_files) == 0:
-        raise gr.Error(f"No AI model found in {models_folder}/", duration=0)
-
-    # Monitoring
-    monitoring_choices = ["mss", "bettercam"] if bettercam_ok else ["mss"]
-    def switch_monitoring_cb(monitoring_str):
-        if monitoring_str == "bettercam" and bettercam_ok:
-            monitor_choices = Monitoring_bettercam.get_monitors_info()
-        else:
-            monitor_choices = Monitoring_mss.get_monitors_info()
-
-        return gr.update(choices=monitor_choices, value=None), None
+        raise Error(f"No AI model found in {models_folder}/", duration=0)
 
     # Monitor selection
-    monitor_choices = Monitoring_mss.get_monitors_info()
-    def switch_monitor_cb(monitoring_str, monitor_id):
-        if monitoring_str == "bettercam" and bettercam_ok:
-            with Monitoring_bettercam(monitor_id, crop_size=520) as mon:
-                return mon.get_frame_np()
-        else:
-            with Monitoring_mss(monitor_id, crop_size=520) as mon:
-                return mon.get_frame_np()
+    monitor_choices = get_monitors()
+    def switch_monitor_cb(monitor_id):
+        monitor = get_monitor_attributes(monitor_id, crop_size=520)  # 520x520 center-crop, just for the debug display
+        return get_frame(monitor)
 
-    with (gr.Blocks(title="Auto skill check") as webui):
-        gr.Markdown("<h1 style='text-align: center;'>DBD Auto skill check</h1>", elem_id="title")
-        gr.Markdown("https://github.com/Manuteaa/dbd_autoSkillCheck")
+    with (Blocks(title="Auto skill check") as webui):
+        Markdown("<h1 style='text-align: center;'>DBD Auto skill check</h1>", elem_id="title")
+        Markdown("https://github.com")
 
-        with gr.Row():
-            with gr.Column(variant="panel"):
-                with gr.Column(variant="panel"):
-                    gr.Markdown("AI inference settings")
-                    ai_model_path = gr.Dropdown(choices=model_files, value=model_files[0][1], label="Name the AI model to use (ONNX or TensorRT Engine)")
-                    device = gr.Radio(choices=devices, value=devices[0], label="Device the AI model will use")
-                    with gr.Row():
-                        monitoring_str = gr.Dropdown(choices=monitoring_choices, value=monitoring_choices[0], label="Screen monitoring library")
-                        monitor_id = gr.Dropdown(choices=monitor_choices, value=monitor_choices[0][1], label="Monitor to use")
-                with gr.Column(variant="panel"):
-                    gr.Markdown("AI Features options")
-                    hit_ante = gr.Slider(minimum=0, maximum=50, step=5, value=20, label="Ante-frontier hit delay in ms")
-                    cpu_stress = gr.Radio(
+        with Row():
+            with Column(variant="panel"):
+                with Column(variant="panel"):
+                    Markdown("AI inference settings")
+                    ai_model_path = Dropdown(choices=model_files, value=model_files[0][1], label="Name the AI model to use (ONNX or TensorRT Engine)")
+                    device = Radio(choices=devices, value=devices[0], label="Device the AI model will use")
+                    monitor_id = Dropdown(choices=monitor_choices, value=monitor_choices[0][1], label="Monitor to use")
+                with Column(variant="panel"):
+                    Markdown("AI Features options")
+                    hit_ante = Slider(minimum=0, maximum=50, step=5, value=20, label="Ante-frontier hit delay in ms")
+                    cpu_stress = Radio(
                         label="CPU workload for AI model inference (increase to improve AI model FPS or decrease to reduce CPU stress)",
                         choices=cpu_choices,
                         value=cpu_choices[1][1],
                     )
-                with gr.Column():
-                    run_button = gr.Button("RUN", variant="primary")
-                    stop_button = gr.Button("STOP", variant="stop")
+                with Column():
+                    run_button = Button("RUN", variant="primary")
+                    stop_button = Button("STOP", variant="stop")
 
-            with gr.Column(variant="panel"):
-                fps = gr.Number(label="AI model FPS", info=fps_info, interactive=False)
-                image_visu = gr.Image(label="Last hit skill check frame", height=224, interactive=False)
-                probs = gr.Label(label="Skill check AI recognition")
+            with Column(variant="panel"):
+                fps = Number(label="AI model FPS", info=fps_info, interactive=False)
+                image_pil = Image(label="Last hit skill check frame", height=224, interactive=False)
+                probs = Label(label="Skill check AI recognition")
 
         monitoring = run_button.click(
             fn=monitor, 
-            inputs=[ai_model_path, device, monitoring_str, monitor_id, hit_ante, cpu_stress],
-            outputs=[fps, image_visu, probs]
+            inputs=[ai_model_path, device, monitor_id, hit_ante, cpu_stress],
+            outputs=[fps, image_pil, probs]
         )
 
         stop_button.click(fn=cleanup, inputs=None, outputs=fps)
-        monitoring_str.blur(fn=switch_monitoring_cb, inputs=[monitoring_str], outputs=[monitor_id, image_visu])  # triggered when selection is closed
-        monitor_id.blur(fn=switch_monitor_cb, inputs=[monitoring_str, monitor_id], outputs=image_visu)  # triggered when selection is closed
+        monitor_id.blur(fn=switch_monitor_cb, inputs=monitor_id, outputs=image_pil)  # triggered when selection is closed
 
     try:
         webui.launch()
